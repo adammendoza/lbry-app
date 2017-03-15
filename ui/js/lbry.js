@@ -1,5 +1,8 @@
 import lighthouse from './lighthouse.js';
 import jsonrpc from './jsonrpc.js';
+import {getLocal, setLocal} from './utils.js';
+import {getPendingPublishes, getPendingPublish, savePendingPublish, removePendingPublish,
+        pendingPublishToDummyClaim, pendingPublishToDummyFileInfo} from './utils.js';
 
 const {remote} = require('electron');
 const menu = remote.require('./menu/main-menu');
@@ -10,6 +13,7 @@ let lbry = {
   daemonConnectionString: 'http://localhost:5279/lbryapi',
   webUiUri: 'http://localhost:5279',
   peerListTimeout: 6000,
+  pendingPublishTimeout: 20 * 60 * 1000,
   colors: {
     primary: '#155B4A'
   },
@@ -251,18 +255,49 @@ lbry.getFileInfoWhenListed = function(name, callback, timeoutCallback, tryNum=0)
   }, () => scheduleNextCheckOrTimeout());
 }
 
+/**
+ * Publishes a file. The optional fileListedCallback is called when the file becomes available in
+ * lbry.file_list() during the publish process.
+ *
+ * This currently includes a work-around to cache the file in local storage so that the pending
+ * publish can appear in the UI immediately.
+ */
 lbry.publish = function(params, fileListedCallback, publishedCallback, errorCallback) {
-  // Publishes a file.
-  // The optional fileListedCallback is called when the file becomes available in
-  // lbry.getFilesInfo() during the publish process.
+  lbry.call('publish', params, (result) => {
+    if (returnedPending) {
+      return;
+    }
 
-  // Use ES6 named arguments instead of directly passing param dict?
-  lbry.call('publish', params, publishedCallback, errorCallback);
-  if (fileListedCallback) {
-    lbry.getFileInfoWhenListed(params.name, function(fileInfo) {
-      fileListedCallback(fileInfo);
-    });
-  }
+    clearTimeout(returnPendingTimeout);
+    publishedCallback(result);
+  }, (err) => {
+    if (returnedPending) {
+      return;
+    }
+
+    clearTimeout(returnPendingTimeout);
+    errorCallback(err);
+  });
+
+  let returnedPending = false;
+  // Give a short grace period in case publish() returns right away or (more likely) gives an error
+  const returnPendingTimeout = setTimeout(() => {
+    returnedPending = true;
+
+    if (publishedCallback) {
+      savePendingPublish(params.name);
+      publishedCallback(true);
+    }
+
+    if (fileListedCallback) {
+      savePendingPublish(params.name);
+      fileListedCallback(true);
+    }
+  }, 2000);
+
+  //lbry.getFileInfoWhenListed(params.name, function(fileInfo) {
+  //  fileListedCallback(fileInfo);
+  //});
 }
 
 lbry.getVersionInfo = function(callback) {
@@ -475,6 +510,60 @@ lbry.showMenuIfNeeded = function() {
   }
   sessionStorage.setItem('menuShown', chosenMenu);
 };
+
+/**
+ * Wrappers for API methods to simulate missing or future behavior. Unlike the old-style stubs,
+ * these are designed to be transparent wrappers around the corresponding API methods.
+ */
+
+/**
+ * Returns results from the file_list API method, plus dummy entries for pending publishes.
+ * (If a real publish with the same name is found, the pending publish will be ignored and removed.)
+ */
+lbry.file_list = function(params={}) {
+  return new Promise((resolve, reject) => {
+    const {name, outpoint} = params;
+
+    /**
+     * If we're searching by outpoint, check first to see if there's a matching pending publish.
+     * Pending publishes use their own faux outpoints that are always unique, so we don't need
+     * to check if there's a real file.
+     */
+    if (outpoint !== undefined) {
+      const pendingPublish = getPendingPublish({outpoint});
+      if (pendingPublish) {
+        resolve([pendingPublishToDummyFileInfo(pendingPublish)]);
+        return;
+      }
+    }
+
+    lbry.call('file_list', params, (fileInfos) => {
+      // Remove any pending publications that are now listed in the file manager
+
+      const pendingPublishes = getPendingPublishes();
+      for (let {name: itemName} of fileInfos) {
+        if (pendingPublishes.find(() => name == itemName)) {
+          removePendingPublish({name: name});
+        }
+      }
+      const dummyFileInfos = getPendingPublishes().map(pendingPublishToDummyFileInfo);
+      resolve([...fileInfos, ...dummyFileInfos]);
+    }, reject, reject);
+  });
+}
+
+lbry.claim_list_mine = function(params={}) {
+  return new Promise((resolve, reject) => {
+    lbry.call('claim_list_mine', params, (claims) => {
+      // Filter out pending publishes when the name is already in the file manager
+      const dummyClaims = getPendingPublishes().filter(
+        (pub) => !claims.find(({name}) => name == pub.name)
+      ).map(pendingPublishToDummyClaim);
+
+      resolve([...claims, ...dummyClaims]);
+    }, reject, reject);
+  });
+}
 
 lbry = new Proxy(lbry, {
   get: function(target, name) {
